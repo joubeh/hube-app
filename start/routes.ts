@@ -1,17 +1,23 @@
 import router from '@adonisjs/core/services/router'
-const UsersController = () => import('#controllers/users_controller')
+import UserController from '#controllers/user_controller'
+import ChatgptController from '#controllers/chatgpt_controller'
 
-router.post('/api/auth', [UsersController, 'auth'])
-router.post('/api/login', [UsersController, 'login'])
-router.post('/api/verify', [UsersController, 'verify'])
-router.post('/api/register', [UsersController, 'register'])
-router.post('/api/forgot-password', [UsersController, 'forgotPassword'])
-router.post('/api/reset-password', [UsersController, 'resetPassword'])
-router.post('/api/logout', [UsersController, 'logout'])
-router.get('/api/user', [UsersController, 'user'])
+/* User */
+router.post('/api/auth', [UserController, 'auth'])
+router.post('/api/login', [UserController, 'login'])
+router.post('/api/verify', [UserController, 'verify'])
+router.post('/api/register', [UserController, 'register'])
+router.post('/api/forgot-password', [UserController, 'forgotPassword'])
+router.post('/api/reset-password', [UserController, 'resetPassword'])
+router.post('/api/logout', [UserController, 'logout'])
+router.get('/api/user', [UserController, 'user'])
 
-router.get('/', async () => {
-  return {
-    hello: 'world',
-  }
-})
+/* Chatgpt */
+router.post('/api/chatgpt/conversation/create', [ChatgptController, 'createConversation'])
+router.post('/api/chatgpt/conversation/:id/message', [ChatgptController, 'messageConversation'])
+router.post('/api/chatgpt/conversation/:id/image', [ChatgptController, 'generateImage'])
+router.post('/api/chatgpt/conversation/:id/share', [ChatgptController, 'shareConversation'])
+router.post('/api/chatgpt/conversation/:id/delete', [ChatgptController, 'deleteConversation'])
+router.get('/api/chatgpt/conversation/:id', [ChatgptController, 'conversation'])
+router.get('/api/chatgpt/conversations', [ChatgptController, 'conversations'])
+router.post('/api/chatgpt/message/:id/update', [ChatgptController, 'updateMessage'])

@@ -59,7 +59,8 @@
     "luxon": "^3.6.1",
     "mysql2": "^3.14.0",
     "openai": "^4.95.1",
-    "reflect-metadata": "^0.2.2"
+    "reflect-metadata": "^0.2.2",
+    "tiktoken": "^1.0.21"
   },
   "hotHook": {
     "boundaries": [

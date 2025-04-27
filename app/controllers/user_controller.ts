@@ -5,7 +5,7 @@ import Verify from '#models/verify'
 import { DateTime } from 'luxon'
 import hash from '@adonisjs/core/services/hash'
 
-export default class UsersController {
+export default class UserController {
   private async sendCode(phone: string) {
     const lastVerify = await Verify.query()
       .where('phone', phone)
