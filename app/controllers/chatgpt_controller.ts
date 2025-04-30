@@ -20,7 +20,7 @@ type ImageGenerationModel = {
   sizes: string[]
   pricing: Pricing
 }
-
+/*
 type TextModel = {
   model: string
   name: string
@@ -31,6 +31,7 @@ type TextModel = {
   input_price_per_million_tokens: number
   output_price_per_million_tokens: number
 }
+  */
 export default class ChatgptController {
   private imageGenerationModels: ImageGenerationModel[] = [
     // {
@@ -94,6 +95,7 @@ export default class ChatgptController {
     },
   ]
 
+  /*
   private textModels: TextModel[] = [
     {
       model: 'gpt-4o',
@@ -137,6 +139,7 @@ export default class ChatgptController {
       output_price_per_million_tokens: 0.6,
     },
   ]
+  */
 
   // todo: return search sources and reasoning thinking
   private async ask(
