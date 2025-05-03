@@ -3,23 +3,11 @@ import openai from '#services/openai_service'
 import ChatgptConversation from '#models/chatgpt_conversation'
 import ChatgptMessage from '#models/chatgpt_message'
 import { randomUUID } from 'crypto'
-import ChatgptImage from '#models/chatgpt_image'
-import { uploadFromUrl } from '#services/storage_service'
+import app from '@adonisjs/core/services/app'
+import path from 'node:path'
+import fs from 'node:fs/promises'
+import env from '#start/env'
 
-type Pricing = {
-  [quality: string]: {
-    [size: string]: number
-  }
-}
-
-type ImageGenerationModel = {
-  model: string
-  name: string
-  description: string
-  qualities: string[]
-  sizes: string[]
-  pricing: Pricing
-}
 /*
 type TextModel = {
   model: string
@@ -33,68 +21,6 @@ type TextModel = {
 }
   */
 export default class ChatgptController {
-  private imageGenerationModels: ImageGenerationModel[] = [
-    // {
-    //   model: 'gpt-image-1',
-    //   name: 'GPT Image 1',
-    //   description: 'جدیدترین مدل تولید عکس',
-    //   qualities: ['low', 'medium', 'high'],
-    //   sizes: ['1024x1024', '1024x1536', '1536x1024'],
-    //   pricing: {
-    //     low: {
-    //       '1024x1024': 0.011,
-    //       '1024x1536': 0.016,
-    //       '1536x1024': 0.016,
-    //     },
-    //     medium: {
-    //       '1024x1024': 0.042,
-    //       '1024x1536': 0.063,
-    //       '1536x1024': 0.063,
-    //     },
-    //     high: {
-    //       '1024x1024': 0.167,
-    //       '1024x1536': 0.25,
-    //       '1536x1024': 0.25,
-    //     },
-    //   },
-    // },
-    {
-      model: 'dall-e-3',
-      name: 'DALL·E 3',
-      description: 'جدیدترین مدل تولید عکس',
-      // description: 'مدل قبلی تولید عکس',
-      qualities: ['standard', 'hd'],
-      sizes: ['1024x1024', '1024x1792', '1792x1024'],
-      pricing: {
-        standard: {
-          '1024x1024': 0.04,
-          '1024x1792': 0.08,
-          '1792x1024': 0.08,
-        },
-        hd: {
-          '1024x1024': 0.08,
-          '1024x1792': 0.12,
-          '1792x1024': 0.12,
-        },
-      },
-    },
-    {
-      model: 'dall-e-2',
-      name: 'DALL·E 2',
-      description: 'مدل قبلی تولید عکس',
-      // description: 'قدیمی ترین مدل تولید عکس',
-      qualities: ['standard'],
-      sizes: ['256x256', '512x512', '1024x1024'],
-      pricing: {
-        standard: {
-          '256x256': 0.016,
-          '512x512': 0.018,
-          '1024x1024': 0.02,
-        },
-      },
-    },
-  ]
-
   /*
   private textModels: TextModel[] = [
     {
@@ -156,7 +82,7 @@ export default class ChatgptController {
     const messages = await ChatgptMessage.query()
       .select(['response_id'])
       .where('conversation_id', conversation.id)
-      .where('role', 'assistant')
+      .whereNotNull('response_id')
       .orderBy('id', 'desc')
       .limit(1)
       .exec()
@@ -206,6 +132,10 @@ export default class ChatgptController {
               useWebSearch: useWebSearch,
               useReasoning: useReasoning,
               reasoningEffort: reasoningEffort,
+              imageSize: null,
+              imageQuality: null,
+              isDone: true,
+              type: 'text',
             },
             {
               conversationId: conversation.id,
@@ -217,13 +147,17 @@ export default class ChatgptController {
               useWebSearch: useWebSearch,
               useReasoning: useReasoning,
               reasoningEffort: reasoningEffort,
+              imageSize: null,
+              imageQuality: null,
+              isDone: true,
+              type: 'text',
             },
           ])
         }
       }
 
       if (messages.length === 0) {
-        conversation.title = prompt.split(' ').slice(0, 5).join(' ')
+        conversation.title = `${prompt.split(' ').slice(0, 5).join(' ')}...`
         await conversation.save()
       }
 
@@ -366,109 +300,136 @@ export default class ChatgptController {
     }
   }
 
-  // async updateMessage(context: HttpContext) {
-  //   const { request, response, auth, params } = context
-  //   const user = await auth.authenticateUsing(['api'])
-
-  //   const { prompt, model } = request.all()
-  //   if (!prompt || !model) {
-  //     return response.unprocessableEntity()
-  //   }
-
-  //   const messageId = params.id
-  //   const message = await ChatgptMessage.find(messageId)
-  //   if (!message) return response.notFound()
-  //   if (message.role !== 'user') return response.badRequest()
-  //   const conversation = await ChatgptConversation.find(message.conversationId)
-  //   if (!conversation) return response.notFound()
-  //   if (conversation.userId !== user.id) return response.forbidden()
-
-  //   const createdAt = message.createdAt.toSQL()!
-  //   await ChatgptMessage.query()
-  //     .where('conversation_id', conversation.id)
-  //     .where('created_at', '>=', createdAt)
-  //     .delete()
-
-  //   return await this.ask(context, prompt, model, conversation)
-  // }
-
   async generateImage(context: HttpContext) {
-    const { request, response, auth } = context
+    const qualities = ['standard', 'hd']
+    const sizes = ['1024x1024', '1024x1792', '1792x1024']
+    // const pricing = {
+    //   standard: {
+    //     '1024x1024': 0.04,
+    //     '1024x1792': 0.08,
+    //     '1792x1024': 0.08,
+    //   },
+    //   hd: {
+    //     '1024x1024': 0.08,
+    //     '1024x1792': 0.12,
+    //     '1792x1024': 0.12,
+    //   },
+    // }
+    const model = 'dall-e-3'
+
+    const { request, response, auth, params } = context
     const user = await auth.authenticateUsing(['api'])
 
-    const { prompt, model, size, quality } = request.all()
+    const { prompt, size, quality } = request.all()
     if (!prompt || !model) {
       return response.unprocessableEntity()
     }
-    const imageGenerationModel = this.imageGenerationModels.find((m) => m.model === model)
-    if (!imageGenerationModel) {
-      return response.unprocessableEntity({ error: 'مدل انتخابی اشتباه است' })
+    if (!sizes.includes(size)) {
+      return response.unprocessableEntity({ error: 'این سایز پشتیبانی نمی شود' })
     }
-    if (!imageGenerationModel.sizes.includes(size)) {
-      return response.unprocessableEntity({ error: 'این مدل از این سایز پشتیبانی نمی کند' })
-    }
-    if (!imageGenerationModel.qualities.includes(quality)) {
-      return response.unprocessableEntity({ error: 'این مدل از این کیفیت پشتیبانی نمی کند' })
+    if (!qualities.includes(quality)) {
+      return response.unprocessableEntity({ error: 'این کیفیت پشتیبانی نمی شود' })
     }
 
-    const chatgptImage = await ChatgptImage.create({
-      userId: user.id,
+    const conversation = await ChatgptConversation.find(params.id)
+    if (!conversation) return response.notFound()
+    if (conversation.userId !== user.id) return response.forbidden()
+
+    await ChatgptMessage.create({
+      conversationId: conversation.id,
       model: model,
-      prompt: prompt,
-      size: size,
-      quality: quality,
+      role: 'user',
+      content: prompt,
+      tokensCount: 0,
+      responseId: null,
+      useWebSearch: false,
+      useReasoning: false,
+      reasoningEffort: null,
+      imageSize: size,
+      imageQuality: quality,
+      isDone: true,
+      type: 'text',
+    })
+    const imageRow = await ChatgptMessage.create({
+      conversationId: conversation.id,
+      model: model,
+      role: 'assistant',
+      content: 'no_content',
+      tokensCount: 0,
+      responseId: null,
+      useWebSearch: false,
+      useReasoning: false,
+      reasoningEffort: null,
+      imageSize: size,
+      imageQuality: quality,
       isDone: false,
-      error: false,
+      type: 'image',
     })
 
     openai.images
       .generate({
         model: model,
-        prompt,
+        prompt: prompt,
         quality: quality,
         size: size,
       })
       .then(async (value) => {
         if (value.data?.length && value.data[0].url) {
-          await uploadFromUrl(
-            value.data[0].url,
-            'chatgpt-generated-images',
-            `${user.id}-${randomUUID()}.png`
-          )
+          const url = value.data[0].url
+          const fetchResponse = await fetch(url)
+          if (!fetchResponse.ok) {
+            throw new Error(`Failed to download image. Status: ${fetchResponse.status}`)
+          }
 
-          chatgptImage.output = value.data[0].url
-          chatgptImage.isDone = true
-          await chatgptImage.save()
+          const dirAddr = `chatgpt/generated-images/${user.id}`
+          const saveDir = app.publicPath(dirAddr)
+          await fs.mkdir(saveDir, { recursive: true })
+
+          const name = `${randomUUID()}.png`
+          const filePath = path.join(saveDir, name)
+
+          const imageBuffer = Buffer.from(await fetchResponse.arrayBuffer())
+          await fs.writeFile(filePath, imageBuffer)
+
+          const dl = `${env.get('APP_URL')}/${dirAddr}/${name}`
+
+          imageRow.content = dl
+          imageRow.isDone = true
+          await imageRow.save()
         } else {
-          throw new Error('خطایی پیش آمده دوباره تلاش کنید')
+          throw new Error('خطایی پیش آمده. عکس تولید نشد.')
         }
       })
-      .catch(async (e) => {
-        chatgptImage.output = e?.message ?? ''
-        chatgptImage.error = true
-        chatgptImage.isDone = true
-        await chatgptImage.save()
+      .catch(async () => {
+        await ChatgptMessage.query()
+          .whereIn('id', [imageRow.id - 1, imageRow.id])
+          .delete()
       })
 
     return {
-      image: chatgptImage,
+      id: imageRow.id,
     }
   }
 
-  async image(context: HttpContext) {
+  async message(context: HttpContext) {
     const { response, auth, params } = context
     const user = await auth.authenticateUsing(['api'])
 
-    const image = await ChatgptImage.find(params.id)
-    if (!image) {
-      return response.notFound()
+    const chatgptMessage = await ChatgptMessage.find(params.id)
+    if (!chatgptMessage) {
+      return {
+        status: 404,
+        message: null,
+      }
     }
-    if (image.userId !== user.id) {
+    const conversation = await ChatgptConversation.findOrFail(chatgptMessage.conversationId)
+    if (conversation.userId !== user.id) {
       return response.forbidden()
     }
 
     return {
-      image: image,
+      status: 200,
+      message: chatgptMessage,
     }
   }
 }

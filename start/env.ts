@@ -27,7 +27,5 @@ export default await Env.create(new URL('../', import.meta.url), {
   OPENAI_API_KEY: Env.schema.string(),
   SMS_API_KEY: Env.schema.string(),
   SMS_VERIFY_TEMPLATE_ID: Env.schema.string(),
-  MINIO_ENDPOINT_KEY: Env.schema.string(),
-  MINIO_ACCESS_KEY: Env.schema.string(),
-  MINIO_SECRET_KEY: Env.schema.string(),
+  APP_URL: Env.schema.string(),
 })

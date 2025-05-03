@@ -32,6 +32,18 @@ export default class ChatgptMessage extends BaseModel {
   @column({ columnName: 'reasoning_effort' })
   declare reasoningEffort: string | null
 
+  @column({ columnName: 'image_size' })
+  declare imageSize: string | null
+
+  @column({ columnName: 'image_quality' })
+  declare imageQuality: string | null
+
+  @column({ columnName: 'is_done' })
+  declare isDone: boolean
+
+  @column()
+  declare type: string
+
   @column.dateTime({ autoCreate: true })
   declare createdAt: DateTime
 
