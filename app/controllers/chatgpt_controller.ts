@@ -109,6 +109,7 @@ export default class ChatgptController {
     reasoningEffort: 'low' | 'medium' | 'high' | null = null,
     filesId: number[]
   ) {
+    console.log('ASK')
     const { response } = context
 
     const files: string[] = []
