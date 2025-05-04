@@ -109,7 +109,6 @@ export default class ChatgptController {
     reasoningEffort: 'low' | 'medium' | 'high' | null = null,
     filesId: number[]
   ) {
-    console.log('ASK')
     const { response } = context
 
     const files: string[] = []
@@ -171,15 +170,6 @@ export default class ChatgptController {
           },
         ]
       }
-
-      console.log({
-        model: model,
-        input: input,
-        stream: true,
-        previous_response_id: previousResponseId,
-        ...(tools.length > 0 && { tools: tools }),
-        ...(useReasoning && { reasoning: { effort: reasoningEffort } }),
-      })
 
       const stream = await openai.responses.create({
         model: model,
