@@ -2,11 +2,16 @@ import type { HttpContext } from '@adonisjs/core/http'
 import openai from '#services/openai_service'
 import ChatgptConversation from '#models/chatgpt_conversation'
 import ChatgptMessage from '#models/chatgpt_message'
-import { randomUUID } from 'crypto'
 import app from '@adonisjs/core/services/app'
 import path from 'node:path'
 import fs from 'node:fs/promises'
+import * as theRealFS from 'fs'
 import env from '#start/env'
+import { cuid } from '@adonisjs/core/helpers'
+import { fileUpload } from '#validators/upload'
+import { DateTime } from 'luxon'
+import ChatgptFile from '#models/chatgpt_file'
+import { OpenAI } from 'openai'
 
 /*
 type TextModel = {
@@ -67,6 +72,32 @@ export default class ChatgptController {
   ]
   */
 
+  private async pollVectorStoreFileProcessing(vectorStoreId: string, fileIds: string) {
+    console.log(`Polling for file processing in Vector Store ${vectorStoreId}...`)
+    let allFilesProcessed = false
+    const targetFileCount = fileIds.length
+
+    while (!allFilesProcessed) {
+      try {
+        const vectorStore = await openai.vectorStores.retrieve(vectorStoreId)
+        const counts = vectorStore.file_counts
+
+        if (counts.failed > 0) {
+          throw new Error(`File processing failed for vector store ${vectorStoreId}`)
+        }
+
+        if (counts.completed === targetFileCount) {
+          console.log('All files processed successfully.')
+          allFilesProcessed = true
+        } else {
+          await new Promise((resolve) => setTimeout(resolve, 3000))
+        }
+      } catch (error) {
+        throw error
+      }
+    }
+  }
+
   // todo: return search sources and reasoning thinking
   private async ask(
     context: HttpContext,
@@ -75,9 +106,26 @@ export default class ChatgptController {
     conversation: ChatgptConversation,
     useWebSearch: boolean = false,
     useReasoning: boolean = false,
-    reasoningEffort: 'low' | 'medium' | 'high' | null = null
+    reasoningEffort: 'low' | 'medium' | 'high' | null = null,
+    filesId: number[]
   ) {
     const { response } = context
+
+    const files: string[] = []
+    const images: string[] = []
+    if (filesId.length > 0) {
+      const user = await context.auth.authenticateUsing(['api'])
+      const chatgptFiles = await ChatgptFile.findMany(filesId)
+      chatgptFiles.forEach((f) => {
+        if (f.userId === user.id) {
+          if (f.type === 'image') {
+            images.push(f.url)
+          } else if (f.vectorStore) {
+            files.push(f.vectorStore)
+          }
+        }
+      })
+    }
 
     const messages = await ChatgptMessage.query()
       .select(['response_id'])
@@ -100,12 +148,44 @@ export default class ChatgptController {
     })
 
     try {
-      const stream = await openai.responses.create({
+      const tools: OpenAI.Responses.Tool[] = []
+      if (useWebSearch) {
+        tools.push({ type: 'web_search_preview' })
+      }
+      if (files.length > 0) {
+        tools.push({ type: 'file_search', vector_store_ids: [...files] })
+      }
+
+      let input: string | OpenAI.Responses.ResponseInput = prompt
+      if (images.length > 0) {
+        const inpImages: OpenAI.Responses.ResponseInputImage[] = images.map((img) => ({
+          type: 'input_image',
+          image_url: img,
+          detail: 'auto',
+        }))
+        input = [
+          {
+            role: 'user',
+            content: [{ type: 'input_text', text: prompt }, ...inpImages],
+          },
+        ]
+      }
+
+      console.log({
         model: model,
-        input: prompt,
+        input: input,
         stream: true,
         previous_response_id: previousResponseId,
-        ...(useWebSearch && { tools: [{ type: 'web_search_preview' }] }),
+        ...(tools.length > 0 && { tools: tools }),
+        ...(useReasoning && { reasoning: { effort: reasoningEffort } }),
+      })
+
+      const stream = await openai.responses.create({
+        model: model,
+        input: input,
+        stream: true,
+        previous_response_id: previousResponseId,
+        ...(tools.length > 0 && { tools: tools }),
         ...(useReasoning && { reasoning: { effort: reasoningEffort } }),
       })
 
@@ -121,38 +201,44 @@ export default class ChatgptController {
         } else if (chunk.type === 'response.created') {
           newResponseId = chunk.response.id
         } else if (chunk.type === 'response.completed') {
-          await ChatgptMessage.createMany([
-            {
-              conversationId: conversation.id,
-              model: model,
-              role: 'user',
-              content: prompt,
-              tokensCount: chunk.response.usage ? chunk.response.usage.input_tokens : 0,
-              responseId: null,
-              useWebSearch: useWebSearch,
-              useReasoning: useReasoning,
-              reasoningEffort: reasoningEffort,
-              imageSize: null,
-              imageQuality: null,
-              isDone: true,
-              type: 'text',
-            },
-            {
-              conversationId: conversation.id,
-              model: model,
-              role: 'assistant',
-              content: modelResponse,
-              tokensCount: chunk.response.usage ? chunk.response.usage.output_tokens : 0,
-              responseId: newResponseId,
-              useWebSearch: useWebSearch,
-              useReasoning: useReasoning,
-              reasoningEffort: reasoningEffort,
-              imageSize: null,
-              imageQuality: null,
-              isDone: true,
-              type: 'text',
-            },
-          ])
+          const userMessage = await ChatgptMessage.create({
+            conversationId: conversation.id,
+            model: model,
+            role: 'user',
+            content: prompt,
+            tokensCount: chunk.response.usage ? chunk.response.usage.input_tokens : 0,
+            responseId: null,
+            useWebSearch: useWebSearch,
+            useReasoning: useReasoning,
+            reasoningEffort: reasoningEffort,
+            imageSize: null,
+            imageQuality: null,
+            isDone: true,
+            type: 'text',
+          })
+
+          if (filesId.length > 0) {
+            await ChatgptFile.query()
+              .update({ messageId: userMessage.id })
+              .whereIn('id', filesId)
+              .exec()
+          }
+
+          await ChatgptMessage.create({
+            conversationId: conversation.id,
+            model: model,
+            role: 'assistant',
+            content: modelResponse,
+            tokensCount: chunk.response.usage ? chunk.response.usage.output_tokens : 0,
+            responseId: newResponseId,
+            useWebSearch: useWebSearch,
+            useReasoning: useReasoning,
+            reasoningEffort: reasoningEffort,
+            imageSize: null,
+            imageQuality: null,
+            isDone: true,
+            type: 'text',
+          })
         }
       }
 
@@ -196,6 +282,7 @@ export default class ChatgptController {
       useWebSearch = false,
       useReasoning = false,
       reasoningEffort = null,
+      files = [],
     } = request.all()
     if (!prompt || !model) {
       return response.unprocessableEntity()
@@ -212,7 +299,8 @@ export default class ChatgptController {
       conversation,
       useWebSearch,
       useReasoning,
-      reasoningEffort
+      reasoningEffort,
+      files
     )
   }
 
@@ -385,7 +473,7 @@ export default class ChatgptController {
           const saveDir = app.publicPath(dirAddr)
           await fs.mkdir(saveDir, { recursive: true })
 
-          const name = `${randomUUID()}.png`
+          const name = `${cuid()}.png`
           const filePath = path.join(saveDir, name)
 
           const imageBuffer = Buffer.from(await fetchResponse.arrayBuffer())
@@ -431,5 +519,90 @@ export default class ChatgptController {
       status: 200,
       message: chatgptMessage,
     }
+  }
+
+  async uploadFile(context: HttpContext) {
+    await new Promise((resolve) => setTimeout(resolve, 10000))
+    const HOURS_UNTIL_EXPIRE = 12
+    const { request, response, auth } = context
+    const user = await auth.authenticateUsing(['api'])
+
+    const payload = await request.validateUsing(fileUpload)
+    const file = payload.file
+    const image = payload.image
+
+    if (file) {
+      if (!file.tmpPath) {
+        return response.internalServerError({
+          message: 'File upload failed internally before processing.',
+        })
+      }
+
+      try {
+        const dirAddr = `chatgpt/uploads/${user.id}`
+        const saveDir = app.publicPath(dirAddr)
+        await fs.mkdir(saveDir, { recursive: true })
+        const name = `${cuid()}.${file.extname}`
+
+        await file.move(saveDir, {
+          name: name,
+          overwrite: false,
+        })
+
+        const fileStream = theRealFS.createReadStream(file.tmpPath)
+        const result = await openai.files.create({
+          file: fileStream,
+          purpose: 'user_data',
+        })
+        const vectorStore = await openai.vectorStores.create({
+          name: 'knowledge_base',
+          file_ids: [result.id],
+        })
+        await this.pollVectorStoreFileProcessing(vectorStore.id, result.id)
+
+        const expiresAt = DateTime.now().plus({ hours: HOURS_UNTIL_EXPIRE })
+        const chatgptFile = await ChatgptFile.create({
+          userId: user.id,
+          messageId: null,
+          url: `${env.get('APP_URL')}/${dirAddr}/${name}`,
+          size: file.size,
+          type: 'file',
+          expiresAt: expiresAt,
+          vectorStore: vectorStore.id,
+        })
+
+        return { file: chatgptFile }
+      } catch (e) {
+        return response.internalServerError({ error: e?.message || 'خطایی پیش آمده' })
+      }
+    }
+
+    if (image) {
+      try {
+        const dirAddr = `chatgpt/uploads/${user.id}`
+        const saveDir = app.publicPath(dirAddr)
+        await fs.mkdir(saveDir, { recursive: true })
+        const name = `${cuid()}.${image.extname}`
+
+        await image.move(saveDir, {
+          name: name,
+          overwrite: false,
+        })
+
+        const chatgptFile = await ChatgptFile.create({
+          userId: user.id,
+          messageId: null,
+          url: `${env.get('APP_URL')}/${dirAddr}/${name}`,
+          size: image.size,
+          type: 'image',
+          expiresAt: null,
+        })
+        return { file: chatgptFile }
+      } catch (e) {
+        return response.internalServerError({ error: e?.message || 'خطایی پیش آمده' })
+      }
+    }
+
+    return response.unprocessableEntity({ error: 'هیچ فایلی آپلود نشد' })
   }
 }
