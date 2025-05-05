@@ -234,7 +234,7 @@ export default class ChatgptController {
       }
 
       if (messages.length === 0) {
-        conversation.title = `${prompt.split(' ').slice(0, 5).join(' ')}...`
+        conversation.title = `${prompt.split(' ').slice(0, 7).join(' ')}...`
         await conversation.save()
       }
 
@@ -279,8 +279,7 @@ export default class ChatgptController {
       return response.unprocessableEntity()
     }
 
-    const conversation = await ChatgptConversation.find(conversationId)
-    if (!conversation) return response.notFound()
+    const conversation = await ChatgptConversation.findOrFail(conversationId)
     if (conversation.userId !== user.id) return response.forbidden()
 
     return await this.ask(
@@ -292,6 +291,35 @@ export default class ChatgptController {
       useReasoning,
       reasoningEffort,
       files
+    )
+  }
+
+  async updateMessage(context: HttpContext) {
+    const { request, response, auth, params } = context
+    const user = await auth.authenticateUsing(['api'])
+
+    const messageId = params.id
+    const oldMessage = await ChatgptMessage.findOrFail(messageId)
+    const conversation = await ChatgptConversation.findOrFail(oldMessage.conversationId)
+    if (conversation.userId !== user.id) return response.forbidden()
+
+    const { prompt, model } = request.all()
+    if (!prompt || !model) {
+      return response.unprocessableEntity()
+    }
+
+    await ChatgptMessage.query().where('id', '>', oldMessage.id).delete()
+    const files = await ChatgptFile.query().select(['id']).where('message_id', oldMessage.id).exec()
+
+    return await this.ask(
+      context,
+      prompt,
+      model,
+      conversation,
+      oldMessage.useWebSearch,
+      oldMessage.useReasoning,
+      oldMessage.reasoningEffort as 'low' | 'medium' | 'high' | null,
+      files.map((f) => f.id)
     )
   }
 
@@ -334,7 +362,6 @@ export default class ChatgptController {
   }
 
   async conversation(context: HttpContext) {
-    // await new Promise((resolve) => setTimeout(resolve, 10000))
     const { response, auth, params } = context
     const user = await auth.authenticateUsing(['api'])
 
@@ -351,10 +378,18 @@ export default class ChatgptController {
       .orderBy('id', 'desc')
       .exec()
     messages.reverse()
+    const files = await ChatgptFile.query()
+      .select()
+      .whereIn(
+        'message_id',
+        messages.map((m) => m.id)
+      )
+      .exec()
 
     return {
       conversation: conversation,
       messages: messages,
+      files: files,
       isOwner: conversation.userId === user.id,
     }
   }
