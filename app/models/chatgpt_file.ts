@@ -26,6 +26,12 @@ export default class ChatgptFile extends BaseModel {
   @column({ columnName: 'vector_store' })
   declare vectorStore: string | null
 
+  @column({ columnName: 'is_ready' })
+  declare isReady: boolean
+
+  @column({ columnName: 'is_expired' })
+  declare isExpired: boolean
+
   @column.dateTime({ autoCreate: true })
   declare createdAt: DateTime
 

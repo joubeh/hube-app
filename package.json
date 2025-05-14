@@ -56,10 +56,11 @@
     "@adonisjs/cors": "^2.2.1",
     "@adonisjs/lucid": "^21.6.0",
     "@adonisjs/static": "^1.1.1",
+    "@rlanz/bull-queue": "^3.1.0",
     "@vinejs/vine": "^3.0.0",
     "luxon": "^3.6.1",
     "mysql2": "^3.14.0",
-    "openai": "^4.95.1",
+    "openai": "^4.98.0",
     "reflect-metadata": "^0.2.2"
   },
   "hotHook": {

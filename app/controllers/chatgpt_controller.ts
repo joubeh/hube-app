@@ -3,102 +3,212 @@ import openai from '#services/openai_service'
 import ChatgptConversation from '#models/chatgpt_conversation'
 import ChatgptMessage from '#models/chatgpt_message'
 import app from '@adonisjs/core/services/app'
-import path from 'node:path'
 import fs from 'node:fs/promises'
 import * as theRealFS from 'fs'
 import env from '#start/env'
 import { cuid } from '@adonisjs/core/helpers'
-import { fileUpload } from '#validators/upload'
+import { ChatgptfileUpload } from '#validators/upload'
 import { DateTime } from 'luxon'
 import ChatgptFile from '#models/chatgpt_file'
 import { OpenAI } from 'openai'
+import queue from '@rlanz/bull-queue/services/main'
+import ActivateChatgptFileJob from '../jobs/activate_chatgpt_file_job.js'
+import GenerateChatgptImageJob from '../jobs/generate_chatgpt_image_job.js'
 
-/*
-type TextModel = {
-  model: string
-  name: string
-  description: string
-  canReasoning: boolean
-  canWebSearch: boolean
-  canFileSearch: boolean
-  input_price_per_million_tokens: number
-  output_price_per_million_tokens: number
-}
-  */
 export default class ChatgptController {
-  /*
-  private textModels: TextModel[] = [
-    {
-      model: 'gpt-4o',
-      name: 'ChatGPT 4o',
-      description: 'برای اکثر سوالات عالی است',
-      canReasoning: false,
-      canWebSearch: true,
-      canFileSearch: false,
-      input_price_per_million_tokens: 2.5,
-      output_price_per_million_tokens: 10,
-    },
-    // {
-    //   model: 'o3',
-    //   name: 'ChatGPT o3',
-    //   description: 'قوی ترین در استدلال پیشرفته',
-    //   canReasoning: true,
-    //   canWebSearch: false,
-    //   canFileSearch: false,
-    //   canGenerateImage: false,
-    //   input_price_per_million_tokens: 10,
-    //   output_price_per_million_tokens: 40,
-    // },
-    {
-      model: 'o4-mini',
-      name: 'ChatGPT o4 mini',
-      description: 'سریع‌ترین در استدلال پیشرفته',
-      canReasoning: true,
-      canWebSearch: false,
-      canFileSearch: false,
-      input_price_per_million_tokens: 1.1,
-      output_price_per_million_tokens: 4.4,
-    },
-    {
-      model: 'gpt-4o-mini',
-      name: 'ChatGPT 4o mini',
-      description: 'عالی برای کارهای روزمره',
-      canReasoning: false,
-      canWebSearch: true,
-      canFileSearch: false,
-      input_price_per_million_tokens: 0.15,
-      output_price_per_million_tokens: 0.6,
-    },
-  ]
-  */
+  async createConversation(context: HttpContext) {
+    const { request, auth } = context
+    const user = await auth.authenticateUsing(['api'])
 
-  private async pollVectorStoreFileProcessing(vectorStoreId: string, fileIds: string) {
-    console.log(`Polling for file processing in Vector Store ${vectorStoreId}...`)
-    let allFilesProcessed = false
-    const targetFileCount = fileIds.length
+    const { isTemporary = false } = request.all()
 
-    while (!allFilesProcessed) {
-      try {
-        const vectorStore = await openai.vectorStores.retrieve(vectorStoreId)
-        const counts = vectorStore.file_counts
+    const conversation = await ChatgptConversation.create({
+      userId: user.id,
+      title: 'New Conversation',
+      isHidden: isTemporary,
+      isPublic: false,
+    })
 
-        if (counts.failed > 0) {
-          throw new Error(`File processing failed for vector store ${vectorStoreId}`)
-        }
+    return { conversation: conversation }
+  }
 
-        if (counts.completed === targetFileCount) {
-          console.log('All files processed successfully.')
-          allFilesProcessed = true
-        } else {
-          await new Promise((resolve) => setTimeout(resolve, 3000))
-        }
-      } catch (error) {
-        throw error
-      }
+  async shareConversation(context: HttpContext) {
+    const { response, auth, params } = context
+    const user = await auth.authenticateUsing(['api'])
+
+    const conversationId = params.id
+    const conversation = await ChatgptConversation.findOrFail(conversationId)
+    if (conversation.isHidden) return response.notFound()
+    if (conversation.userId !== user.id) return response.forbidden()
+
+    conversation.isPublic = true
+    await conversation.save()
+
+    return {
+      ok: true,
     }
   }
 
-  // todo: return search sources and reasoning thinking
+  async deleteConversation(context: HttpContext) {
+    const { response, auth, params } = context
+    const user = await auth.authenticateUsing(['api'])
+
+    const conversationId = params.id
+    const conversation = await ChatgptConversation.findOrFail(conversationId)
+    if (!conversation.isHidden) return response.notFound()
+    if (conversation.userId !== user.id) return response.forbidden()
+
+    conversation.isHidden = true
+    await conversation.save()
+
+    return {
+      ok: true,
+    }
+  }
+
+  async uploadFile(context: HttpContext) {
+    const HOURS_UNTIL_EXPIRE = 12
+    const { request, response, auth } = context
+    const user = await auth.authenticateUsing(['api'])
+
+    const payload = await request.validateUsing(ChatgptfileUpload)
+    const file = payload.file
+    const image = payload.image
+
+    if (file) {
+      if (!file.tmpPath) {
+        return response.internalServerError({
+          message: 'فایل آپلود نشد.',
+        })
+      }
+
+      try {
+        const dirAddr = `chatgpt/uploads/${user.id}`
+        const saveDir = app.publicPath(dirAddr)
+        await fs.mkdir(saveDir, { recursive: true })
+        const name = `${cuid()}.${file.extname}`
+
+        await file.move(saveDir, {
+          name: name,
+          overwrite: false,
+        })
+
+        const fileStream = theRealFS.createReadStream(file.tmpPath)
+        const result = await openai.files.create({
+          file: fileStream,
+          purpose: 'user_data',
+        })
+        const vectorStore = await openai.vectorStores.create({
+          name: 'knowledge_base',
+          file_ids: [result.id],
+        })
+
+        const expiresAt = DateTime.now().plus({ hours: HOURS_UNTIL_EXPIRE })
+        const chatgptFile = await ChatgptFile.create({
+          userId: user.id,
+          messageId: null,
+          url: `${env.get('APP_URL')}/${dirAddr}/${name}`,
+          size: file.size,
+          type: 'file',
+          expiresAt: expiresAt,
+          vectorStore: vectorStore.id,
+          isReady: false,
+          isExpired: false,
+        })
+
+        queue.dispatch(ActivateChatgptFileJob, {
+          vectorStoreId: vectorStore.id,
+          fileId: chatgptFile.id,
+        })
+
+        return { file: chatgptFile }
+      } catch (e) {
+        return response.internalServerError({ error: e?.message || 'خطایی پیش آمده' })
+      }
+    }
+
+    if (image) {
+      try {
+        const dirAddr = `chatgpt/uploads/${user.id}`
+        const saveDir = app.publicPath(dirAddr)
+        await fs.mkdir(saveDir, { recursive: true })
+        const name = `${cuid()}.${image.extname}`
+
+        await image.move(saveDir, {
+          name: name,
+          overwrite: false,
+        })
+
+        const chatgptFile = await ChatgptFile.create({
+          userId: user.id,
+          messageId: null,
+          url: `${env.get('APP_URL')}/${dirAddr}/${name}`,
+          size: image.size,
+          type: 'image',
+          expiresAt: null,
+          isReady: true,
+          isExpired: false,
+        })
+        return { file: chatgptFile }
+      } catch (e) {
+        return response.internalServerError({ error: e?.message || 'خطایی پیش آمده' })
+      }
+    }
+
+    return response.unprocessableEntity({ error: 'هیچ فایلی آپلود نشد' })
+  }
+
+  async fileStatus(context: HttpContext) {
+    const { response, auth, params } = context
+    const user = await auth.authenticateUsing(['api'])
+    const id = params.id
+    const file = await ChatgptFile.findOrFail(id)
+    if (file.userId !== user.id) return response.forbidden()
+    return { isReady: file.isReady }
+  }
+
+  async conversation(context: HttpContext) {
+    const { response, auth, params } = context
+    const user = await auth.authenticateUsing(['api'])
+
+    const conversationId = params.id
+    const conversation = await ChatgptConversation.findOrFail(conversationId)
+
+    if (conversation.isHidden) return response.notFound({ error: 'گفتگو وجود ندارد' })
+    if (!conversation.isPublic && conversation.userId !== user.id)
+      return response.forbidden({ error: 'شما به این گفتگو دسترسی ندارید' })
+
+    const messages = await ChatgptMessage.query()
+      .where('conversation_id', conversationId)
+      .preload('files')
+      .orderBy('created_at', 'asc')
+
+    return {
+      conversation: conversation,
+      messages: messages,
+      isOwner: conversation.userId === user.id,
+    }
+  }
+
+  async conversations(context: HttpContext) {
+    const { auth, request } = context
+    const user = await auth.authenticateUsing(['api'])
+
+    const page = Object.hasOwn(request.qs(), 'page') ? parseInt(request.qs().page) : 1
+    const PER_PAGE = 20
+    const conversations = await ChatgptConversation.query()
+      .where('user_id', user.id)
+      .where('is_hidden', false)
+      .orderBy('created_at', 'desc')
+      .offset((page - 1) * PER_PAGE)
+      .limit(PER_PAGE)
+      .exec()
+
+    return {
+      conversations: conversations,
+    }
+  }
+
   private async ask(
     context: HttpContext,
     prompt: string,
@@ -107,7 +217,8 @@ export default class ChatgptController {
     useWebSearch: boolean = false,
     useReasoning: boolean = false,
     reasoningEffort: 'low' | 'medium' | 'high' | null = null,
-    filesId: number[]
+    filesId: number[],
+    parent: ChatgptMessage | null
   ) {
     const { response } = context
 
@@ -126,15 +237,6 @@ export default class ChatgptController {
         }
       })
     }
-
-    const messages = await ChatgptMessage.query()
-      .select(['response_id'])
-      .where('conversation_id', conversation.id)
-      .whereNotNull('response_id')
-      .orderBy('id', 'desc')
-      .limit(1)
-      .exec()
-    const previousResponseId = messages.length > 0 ? messages[0].responseId : null
 
     response.response.writeHead(200, {
       'Content-Type': 'text/plain; charset=utf-8',
@@ -175,7 +277,7 @@ export default class ChatgptController {
         model: model,
         input: input,
         stream: true,
-        previous_response_id: previousResponseId,
+        previous_response_id: parent ? parent.responseId : null,
         ...(tools.length > 0 && { tools: tools }),
         ...(useReasoning && { reasoning: { effort: reasoningEffort } }),
       })
@@ -206,13 +308,11 @@ export default class ChatgptController {
             imageQuality: null,
             isDone: true,
             type: 'text',
+            parentId: parent ? parent.id : null,
           })
 
           if (filesId.length > 0) {
-            await ChatgptFile.query()
-              .update({ messageId: userMessage.id })
-              .whereIn('id', filesId)
-              .exec()
+            await ChatgptFile.query().whereIn('id', filesId).update({ messageId: userMessage.id })
           }
 
           await ChatgptMessage.create({
@@ -229,37 +329,17 @@ export default class ChatgptController {
             imageQuality: null,
             isDone: true,
             type: 'text',
+            parentId: parent ? parent.id : null,
           })
         }
-      }
-
-      if (messages.length === 0) {
-        conversation.title = `${prompt.split(' ').slice(0, 7).join(' ')}...`
-        await conversation.save()
       }
 
       response.response.end()
     } catch (e) {
       console.log(e)
-      response.response.write('Something went wrong!')
+      response.response.write('خطایی پیش آمده.')
       response.response.end()
     }
-  }
-
-  async createConversation(context: HttpContext) {
-    const { request, auth } = context
-    const user = await auth.authenticateUsing(['api'])
-
-    const { isTemporary = false } = request.all()
-
-    const conversation = await ChatgptConversation.create({
-      userId: user.id,
-      title: 'New Conversation',
-      isHidden: isTemporary,
-      isPublic: false,
-    })
-
-    return { conversation: conversation }
   }
 
   async messageConversation(context: HttpContext) {
@@ -270,10 +350,11 @@ export default class ChatgptController {
     const {
       prompt,
       model,
+      parentId = null,
       useWebSearch = false,
       useReasoning = false,
       reasoningEffort = null,
-      files = [],
+      filesId = [],
     } = request.all()
     if (!prompt || !model) {
       return response.unprocessableEntity()
@@ -281,6 +362,12 @@ export default class ChatgptController {
 
     const conversation = await ChatgptConversation.findOrFail(conversationId)
     if (conversation.userId !== user.id) return response.forbidden()
+
+    if (!parentId) {
+      conversation.title = `${prompt.split(' ').slice(0, 7).join(' ')}...`
+      await conversation.save()
+    }
+    const parent = parentId ? await ChatgptMessage.find(parentId) : null
 
     return await this.ask(
       context,
@@ -290,7 +377,8 @@ export default class ChatgptController {
       useWebSearch,
       useReasoning,
       reasoningEffort,
-      files
+      filesId,
+      parent
     )
   }
 
@@ -303,139 +391,52 @@ export default class ChatgptController {
     const conversation = await ChatgptConversation.findOrFail(oldMessage.conversationId)
     if (conversation.userId !== user.id) return response.forbidden()
 
-    const { prompt, model } = request.all()
-    if (!prompt || !model) {
-      return response.unprocessableEntity()
+    if (oldMessage.role === 'user') {
+      const { prompt } = request.all()
+      if (!prompt) {
+        return response.unprocessableEntity()
+      }
+
+      const files = await ChatgptFile.query().where('message_id', oldMessage.id).exec()
+      const parent = oldMessage.parentId ? await ChatgptMessage.find(oldMessage.parentId) : null
+
+      return await this.ask(
+        context,
+        prompt,
+        oldMessage.model,
+        conversation,
+        oldMessage.useWebSearch,
+        oldMessage.useReasoning,
+        oldMessage.reasoningEffort as 'low' | 'medium' | 'high' | null,
+        files.map((f) => f.id),
+        parent
+      )
     }
 
-    await ChatgptMessage.query().where('id', '>', oldMessage.id).delete()
-    const files = await ChatgptFile.query().select(['id']).where('message_id', oldMessage.id).exec()
-
+    const parent = await ChatgptMessage.find(oldMessage.parentId)
     return await this.ask(
       context,
-      prompt,
-      model,
+      oldMessage.content,
+      oldMessage.model,
       conversation,
       oldMessage.useWebSearch,
       oldMessage.useReasoning,
       oldMessage.reasoningEffort as 'low' | 'medium' | 'high' | null,
-      files.map((f) => f.id)
+      [],
+      parent
     )
   }
 
-  async shareConversation(context: HttpContext) {
-    const { response, auth, params } = context
-    const user = await auth.authenticateUsing(['api'])
-
-    const conversationId = params.id
-    const conversation = await ChatgptConversation.find(conversationId)
-
-    if (!conversation) return response.notFound()
-    if (conversation.isHidden) return response.badRequest()
-    if (conversation.userId !== user.id) return response.forbidden()
-
-    conversation.isPublic = true
-    await conversation.save()
-
-    return {
-      ok: true,
-    }
-  }
-
-  async deleteConversation(context: HttpContext) {
-    const { response, auth, params } = context
-    const user = await auth.authenticateUsing(['api'])
-
-    const conversationId = params.id
-    const conversation = await ChatgptConversation.find(conversationId)
-
-    if (!conversation) return response.notFound()
-    if (!conversation.isHidden) return response.badRequest()
-    if (conversation.userId !== user.id) return response.forbidden()
-
-    conversation.isHidden = true
-    await conversation.save()
-
-    return {
-      ok: true,
-    }
-  }
-
-  async conversation(context: HttpContext) {
-    const { response, auth, params } = context
-    const user = await auth.authenticateUsing(['api'])
-
-    const conversationId = params.id
-    const conversation = await ChatgptConversation.find(conversationId)
-
-    if (!conversation || conversation.isHidden)
-      return response.notFound({ error: 'گفتگو وجود ندارد' })
-    if (!conversation.isPublic && conversation.userId !== user.id)
-      return response.forbidden({ error: 'شما به این گفتگو دسترسی ندارید' })
-
-    const messages = await ChatgptMessage.query()
-      .where('conversation_id', conversationId)
-      .orderBy('id', 'desc')
-      .exec()
-    messages.reverse()
-    const files = await ChatgptFile.query()
-      .select()
-      .whereIn(
-        'message_id',
-        messages.map((m) => m.id)
-      )
-      .exec()
-
-    return {
-      conversation: conversation,
-      messages: messages,
-      files: files,
-      isOwner: conversation.userId === user.id,
-    }
-  }
-
-  // TODO: add pagination
-  async conversations(context: HttpContext) {
-    const { auth, request } = context
-    const user = await auth.authenticateUsing(['api'])
-
-    const page = Object.hasOwn(request.qs(), 'page') ? parseInt(request.qs().page) : 1
-    const PER_PAGE = 20
-    const conversations = await ChatgptConversation.query()
-      .where('user_id', user.id)
-      .where('is_hidden', false)
-      .orderBy('created_at', 'desc')
-      .offset((page - 1) * PER_PAGE)
-      .limit(PER_PAGE)
-      .exec()
-
-    return {
-      conversations: conversations,
-    }
-  }
-
   async generateImage(context: HttpContext) {
-    const qualities = ['standard', 'hd']
-    const sizes = ['1024x1024', '1024x1792', '1792x1024']
-    // const pricing = {
-    //   standard: {
-    //     '1024x1024': 0.04,
-    //     '1024x1792': 0.08,
-    //     '1792x1024': 0.08,
-    //   },
-    //   hd: {
-    //     '1024x1024': 0.08,
-    //     '1024x1792': 0.12,
-    //     '1792x1024': 0.12,
-    //   },
-    // }
-    const model = 'dall-e-3'
+    const qualities = ['low', 'medium', 'high']
+    const sizes = ['1024x1024', '1024x1536', '1536x1024']
+    const model = 'gpt-image-1'
 
     const { request, response, auth, params } = context
     const user = await auth.authenticateUsing(['api'])
 
-    const { prompt, size, quality } = request.all()
-    if (!prompt || !model) {
+    const { prompt, size, quality, parentId = null, filesId = [] } = request.all()
+    if (!prompt) {
       return response.unprocessableEntity()
     }
     if (!sizes.includes(size)) {
@@ -449,7 +450,22 @@ export default class ChatgptController {
     if (!conversation) return response.notFound()
     if (conversation.userId !== user.id) return response.forbidden()
 
-    await ChatgptMessage.create({
+    const imagesId: number[] = []
+    const images: string[] = []
+    if (filesId.length > 0) {
+      const user = await context.auth.authenticateUsing(['api'])
+      const chatgptFiles = await ChatgptFile.findMany(filesId)
+      chatgptFiles.forEach((f) => {
+        if (f.userId === user.id) {
+          if (f.type === 'image') {
+            images.push(f.url)
+            imagesId.push(f.id)
+          }
+        }
+      })
+    }
+
+    const requestMessage = await ChatgptMessage.create({
       conversationId: conversation.id,
       model: model,
       role: 'user',
@@ -463,6 +479,7 @@ export default class ChatgptController {
       imageQuality: quality,
       isDone: true,
       type: 'text',
+      parentId: parentId ? parentId : null,
     })
     const imageRow = await ChatgptMessage.create({
       conversationId: conversation.id,
@@ -478,47 +495,28 @@ export default class ChatgptController {
       imageQuality: quality,
       isDone: false,
       type: 'image',
+      parentId: requestMessage.id,
     })
 
-    openai.images
-      .generate({
-        model: model,
-        prompt: prompt,
-        quality: quality,
-        size: size,
-      })
-      .then(async (value) => {
-        if (value.data?.length && value.data[0].url) {
-          const url = value.data[0].url
-          const fetchResponse = await fetch(url)
-          if (!fetchResponse.ok) {
-            throw new Error(`Failed to download image. Status: ${fetchResponse.status}`)
-          }
+    await queue.dispatch(GenerateChatgptImageJob, {
+      model: model,
+      prompt: prompt,
+      quality: quality,
+      size: size,
+      messageId: imageRow.id,
+      userId: user.id,
+      mode: images.length > 0 ? 'edit' : 'generate',
+      inputImages: images,
+    })
 
-          const dirAddr = `chatgpt/generated-images/${user.id}`
-          const saveDir = app.publicPath(dirAddr)
-          await fs.mkdir(saveDir, { recursive: true })
+    if (images.length > 0) {
+      await ChatgptFile.query().whereIn('id', imagesId).update({ messageId: requestMessage.id })
+    }
 
-          const name = `${cuid()}.png`
-          const filePath = path.join(saveDir, name)
-
-          const imageBuffer = Buffer.from(await fetchResponse.arrayBuffer())
-          await fs.writeFile(filePath, imageBuffer)
-
-          const dl = `${env.get('APP_URL')}/${dirAddr}/${name}`
-
-          imageRow.content = dl
-          imageRow.isDone = true
-          await imageRow.save()
-        } else {
-          throw new Error('خطایی پیش آمده. عکس تولید نشد.')
-        }
-      })
-      .catch(async () => {
-        await ChatgptMessage.query()
-          .whereIn('id', [imageRow.id - 1, imageRow.id])
-          .delete()
-      })
+    if (!parentId) {
+      conversation.title = `${prompt.split(' ').slice(0, 7).join(' ')}...`
+      await conversation.save()
+    }
 
     return {
       id: imageRow.id,
@@ -529,106 +527,111 @@ export default class ChatgptController {
     const { response, auth, params } = context
     const user = await auth.authenticateUsing(['api'])
 
-    const chatgptMessage = await ChatgptMessage.find(params.id)
-    if (!chatgptMessage) {
-      return {
-        status: 404,
-        message: null,
-      }
-    }
-    const conversation = await ChatgptConversation.findOrFail(chatgptMessage.conversationId)
+    const messageId = params.id
+    const message = await ChatgptMessage.findOrFail(messageId)
+    const conversation = await ChatgptConversation.findOrFail(message.conversationId)
     if (conversation.userId !== user.id) {
       return response.forbidden()
     }
 
-    return {
-      status: 200,
-      message: chatgptMessage,
-    }
+    return { message: message }
   }
 
-  async uploadFile(context: HttpContext) {
-    await new Promise((resolve) => setTimeout(resolve, 10000))
-    const HOURS_UNTIL_EXPIRE = 12
+  async messageTTS(context: HttpContext) {}
+
+  async transcribe(context: HttpContext) {}
+
+  async generateImageSora(context: HttpContext) {
+    const qualities = ['low', 'medium', 'high']
+    const sizes = ['1024x1024', '1024x1536', '1536x1024']
+    const model = 'gpt-image-1'
+
     const { request, response, auth } = context
     const user = await auth.authenticateUsing(['api'])
 
-    const payload = await request.validateUsing(fileUpload)
-    const file = payload.file
-    const image = payload.image
-
-    if (file) {
-      if (!file.tmpPath) {
-        return response.internalServerError({
-          message: 'File upload failed internally before processing.',
-        })
-      }
-
-      try {
-        const dirAddr = `chatgpt/uploads/${user.id}`
-        const saveDir = app.publicPath(dirAddr)
-        await fs.mkdir(saveDir, { recursive: true })
-        const name = `${cuid()}.${file.extname}`
-
-        await file.move(saveDir, {
-          name: name,
-          overwrite: false,
-        })
-
-        const fileStream = theRealFS.createReadStream(file.tmpPath)
-        const result = await openai.files.create({
-          file: fileStream,
-          purpose: 'user_data',
-        })
-        const vectorStore = await openai.vectorStores.create({
-          name: 'knowledge_base',
-          file_ids: [result.id],
-        })
-        await this.pollVectorStoreFileProcessing(vectorStore.id, result.id)
-
-        const expiresAt = DateTime.now().plus({ hours: HOURS_UNTIL_EXPIRE })
-        const chatgptFile = await ChatgptFile.create({
-          userId: user.id,
-          messageId: null,
-          url: `${env.get('APP_URL')}/${dirAddr}/${name}`,
-          size: file.size,
-          type: 'file',
-          expiresAt: expiresAt,
-          vectorStore: vectorStore.id,
-        })
-
-        return { file: chatgptFile }
-      } catch (e) {
-        return response.internalServerError({ error: e?.message || 'خطایی پیش آمده' })
-      }
+    const { prompt, size, quality, filesId = [] } = request.all()
+    if (!prompt) {
+      return response.unprocessableEntity()
+    }
+    if (!sizes.includes(size)) {
+      return response.unprocessableEntity({ error: 'این سایز پشتیبانی نمی شود' })
+    }
+    if (!qualities.includes(quality)) {
+      return response.unprocessableEntity({ error: 'این کیفیت پشتیبانی نمی شود' })
     }
 
-    if (image) {
-      try {
-        const dirAddr = `chatgpt/uploads/${user.id}`
-        const saveDir = app.publicPath(dirAddr)
-        await fs.mkdir(saveDir, { recursive: true })
-        const name = `${cuid()}.${image.extname}`
+    const conversation = await ChatgptConversation.create({
+      userId: user.id,
+      title: 'Image Conversation',
+      isHidden: true,
+      isPublic: false,
+    })
 
-        await image.move(saveDir, {
-          name: name,
-          overwrite: false,
-        })
-
-        const chatgptFile = await ChatgptFile.create({
-          userId: user.id,
-          messageId: null,
-          url: `${env.get('APP_URL')}/${dirAddr}/${name}`,
-          size: image.size,
-          type: 'image',
-          expiresAt: null,
-        })
-        return { file: chatgptFile }
-      } catch (e) {
-        return response.internalServerError({ error: e?.message || 'خطایی پیش آمده' })
-      }
+    const imagesId: number[] = []
+    const images: string[] = []
+    if (filesId.length > 0) {
+      const user = await context.auth.authenticateUsing(['api'])
+      const chatgptFiles = await ChatgptFile.findMany(filesId)
+      chatgptFiles.forEach((f) => {
+        if (f.userId === user.id) {
+          if (f.type === 'image') {
+            images.push(f.url)
+            imagesId.push(f.id)
+          }
+        }
+      })
     }
 
-    return response.unprocessableEntity({ error: 'هیچ فایلی آپلود نشد' })
+    const requestMessage = await ChatgptMessage.create({
+      conversationId: conversation.id,
+      model: model,
+      role: 'user',
+      content: prompt,
+      tokensCount: 0,
+      responseId: null,
+      useWebSearch: false,
+      useReasoning: false,
+      reasoningEffort: null,
+      imageSize: size,
+      imageQuality: quality,
+      isDone: true,
+      type: 'text',
+      parentId: null,
+    })
+    const imageRow = await ChatgptMessage.create({
+      conversationId: conversation.id,
+      model: model,
+      role: 'assistant',
+      content: 'no_content',
+      tokensCount: 0,
+      responseId: null,
+      useWebSearch: false,
+      useReasoning: false,
+      reasoningEffort: null,
+      imageSize: size,
+      imageQuality: quality,
+      isDone: false,
+      type: 'image',
+      parentId: requestMessage.id,
+    })
+
+    await queue.dispatch(GenerateChatgptImageJob, {
+      model: model,
+      prompt: prompt,
+      quality: quality,
+      size: size,
+      messageId: imageRow.id,
+      userId: user.id,
+      mode: images.length > 0 ? 'edit' : 'generate',
+      inputImages: images,
+    })
+
+    if (images.length > 0) {
+      await ChatgptFile.query().whereIn('id', imagesId).update({ messageId: requestMessage.id })
+    }
+
+    return {
+      id: imageRow.id,
+    }
   }
 }

@@ -1,6 +1,6 @@
 import vine from '@vinejs/vine'
 
-export const fileUpload = vine.compile(
+export const ChatgptfileUpload = vine.compile(
   vine.object({
     file: vine
       .file({

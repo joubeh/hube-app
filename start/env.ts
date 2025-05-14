@@ -28,4 +28,13 @@ export default await Env.create(new URL('../', import.meta.url), {
   SMS_API_KEY: Env.schema.string(),
   SMS_VERIFY_TEMPLATE_ID: Env.schema.string(),
   APP_URL: Env.schema.string(),
+
+  /*
+  |----------------------------------------------------------
+  | Variables for @rlanz/bull-queue
+  |----------------------------------------------------------
+  */
+  QUEUE_REDIS_HOST: Env.schema.string({ format: 'host' }),
+  QUEUE_REDIS_PORT: Env.schema.number(),
+  QUEUE_REDIS_PASSWORD: Env.schema.string.optional(),
 })
