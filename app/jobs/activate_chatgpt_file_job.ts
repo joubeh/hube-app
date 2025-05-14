@@ -39,5 +39,7 @@ export default class ActivateChatgptFileJob extends Job {
   /**
    * This is an optional method that gets called when the retries has exceeded and is marked failed.
    */
-  async rescue(payload: ActivateChatgptFileJobPayload) {}
+  async rescue(payload: ActivateChatgptFileJobPayload) {
+    console.log(payload) // todo remove
+  }
 }

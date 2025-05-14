@@ -24,7 +24,7 @@ router.post('/api/chatgpt/conversation/:id/message', [ChatgptController, 'messag
 router.post('/api/chatgpt/message/:id/update', [ChatgptController, 'updateMessage'])
 router.post('/api/chatgpt/conversation/:id/image/generate', [ChatgptController, 'generateImage'])
 router.get('/api/chatgpt/message/:id', [ChatgptController, 'message'])
-router.get('/api/chatgpt/message/:id/tts', [ChatgptController, 'messageTTS'])
-router.post('/api/chatgpt/transcribe', [ChatgptController, 'transcribe'])
+// router.get('/api/chatgpt/message/:id/tts', [ChatgptController, 'messageTTS'])
+// router.post('/api/chatgpt/transcribe', [ChatgptController, 'transcribe'])
 
 router.post('/api/sora/generate', [ChatgptController, 'generateImageSora'])

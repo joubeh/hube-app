@@ -537,9 +537,9 @@ export default class ChatgptController {
     return { message: message }
   }
 
-  async messageTTS(context: HttpContext) {}
+  // async messageTTS(context: HttpContext) {}
 
-  async transcribe(context: HttpContext) {}
+  // async transcribe(context: HttpContext) {}
 
   async generateImageSora(context: HttpContext) {
     const qualities = ['low', 'medium', 'high']
